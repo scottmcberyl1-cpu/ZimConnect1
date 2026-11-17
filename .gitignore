@@ -1,2 +1,6 @@
 node_modules/
 backend/data/
+backend/backups/
+.env
+.env.*
+!.env.example
