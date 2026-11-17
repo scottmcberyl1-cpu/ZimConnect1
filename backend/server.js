@@ -104,7 +104,7 @@ function createApp(db, options = {}) {
     legacyHeaders: false,
     handler: (req, res) => res.status(429).json({ error: "Too many authentication attempts. Try again later." })
   });
-  const trustProxyHops = Number(process.env.TRUST_PROXY_HOPS || 0);
+  const trustProxyHops = Number(process.env.TRUST_PROXY_HOPS || (process.env.NODE_ENV === "production" ? 1 : 0));
   app.set("trust proxy", Number.isInteger(trustProxyHops) && trustProxyHops >= 0 ? trustProxyHops : 0);
   app.disable("x-powered-by");
   app.use(helmet({
@@ -130,11 +130,50 @@ function createApp(db, options = {}) {
     });
     next();
   });
+  const corsOrigins = new Set((process.env.CORS_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean));
+  app.use((req, res, next) => {
+    const origin = req.get("origin");
+    if (origin && corsOrigins.has(origin)) {
+      res.set({
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type",
+        Vary: "Origin"
+      });
+    }
+    if (req.method === "OPTIONS") {
+      if (!origin || !corsOrigins.has(origin)) return res.status(403).end();
+      return res.status(204).end();
+    }
+    next();
+  });
+  app.use(express.urlencoded({ extended: false, limit: "16kb" }));
   app.use(express.json({ limit: "16kb" }));
 
-  app.get("/api/health", (req, res) => {
-    db.prepare("SELECT 1").get();
-    res.json({ status: "ok" });
+  app.get("/api/health", async (req, res) => {
+    try {
+      await db.prepare("SELECT 1").get();
+      res.json({ status: "ok" });
+    } catch (error) {
+      console.error("Database health check failed:", error);
+      res.status(503).json({ status: "unavailable" });
+    }
+  });
+
+  app.get("/api/config/public", (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.json({
+      paymentEnabled: process.env.NODE_ENV !== "production" || process.env.PAYNOW_ENABLED === "true",
+      paymentProvider: process.env.PAYNOW_ENABLED === "true" ? "Paynow" : "sandbox",
+      currency: "USD",
+      identityUploadsEnabled: process.env.IDENTITY_UPLOADS_ENABLED === "true" &&
+        Boolean(process.env.IDENTITY_POLICY_URL && process.env.IDENTITY_POLICY_VERSION),
+      identityPolicyUrl: process.env.IDENTITY_POLICY_URL || null,
+      videoUploadsEnabled: process.env.VIDEO_UPLOADS_ENABLED === "true",
+      mapsEnabled: process.env.MAPS_ENABLED === "true",
+      aiSupportEnabled: process.env.AI_SUPPORT_ENABLED === "true",
+      aiDisclosure: "Your message will be sent to an external AI provider after common email, phone, and Zimbabwe ID patterns are redacted. Redaction is not guaranteed to remove all personal information."
+    });
   });
 
   app.post("/api/auth/register", authLimiter, async (req, res) => {
@@ -161,24 +200,24 @@ function createApp(db, options = {}) {
 
     let challenges;
     try {
-      challenges = db.transaction(() => {
-        db.prepare(`
+      challenges = await db.transaction(async () => {
+        await db.prepare(`
           INSERT INTO users (id, full_name, email, password_hash, phone, location, created_at, updated_at)
           VALUES (@id, @fullName, @email, @passwordHash, @phone, @location, @now, @now)
         `).run(user);
         return {
-          emailToken: issueEmailToken(db, user.id),
-          phoneCode: issuePhoneCode(db, user.id)
+          emailToken: await issueEmailToken(db, user.id),
+          phoneCode: await issuePhoneCode(db, user.id)
         };
       })();
     } catch (error) {
-      if (error.code === "SQLITE_CONSTRAINT_UNIQUE") {
+      if (error.code === "SQLITE_CONSTRAINT_UNIQUE" || error.code === "23505") {
         throw new HttpError(409, "An account with that email already exists.");
       }
       throw error;
     }
 
-    const createdUser = db.prepare("SELECT * FROM users WHERE id = ?").get(user.id);
+    const createdUser = await db.prepare("SELECT * FROM users WHERE id = ?").get(user.id);
     try {
       await sendVerificationMessages(services, createdUser, challenges);
     } catch (error) {
@@ -194,7 +233,7 @@ function createApp(db, options = {}) {
       throw new HttpError(400, "Email or password is incorrect.");
     }
 
-    const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
+    const user = await db.prepare("SELECT * FROM users WHERE email = ?").get(email);
     const matches = await verifyPassword(
       req.body.password,
       user ? user.password_hash : `${DUMMY_SALT.toString("hex")}:${DUMMY_HASH.toString("hex")}`
@@ -204,17 +243,17 @@ function createApp(db, options = {}) {
       throw new HttpError(403, "Verify both email and phone before signing in.");
     }
 
-    db.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(new Date().toISOString());
-    res.json({ user: publicUser(user), ...createSession(db, user.id) });
+    await db.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(new Date().toISOString());
+    res.json({ user: publicUser(user), ...await createSession(db, user.id) });
   });
 
   app.post("/api/auth/resend-verification", authLimiter, async (req, res) => {
     if (!isObject(req.body)) throw new HttpError(400, "Request body must be a JSON object.");
     const email = normalizeEmail(req.body.email);
-    const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
+    const user = await db.prepare("SELECT * FROM users WHERE email = ?").get(email);
     if (user && (!user.email_verified_at || !user.phone_verified_at)) {
-      const emailToken = user.email_verified_at ? null : issueEmailToken(db, user.id);
-      const phoneCode = user.phone_verified_at ? null : issuePhoneCode(db, user.id);
+      const emailToken = user.email_verified_at ? null : await issueEmailToken(db, user.id);
+      const phoneCode = user.phone_verified_at ? null : await issuePhoneCode(db, user.id);
       try {
         await sendVerificationMessages(services, user, { emailToken, phoneCode });
       } catch (error) {
@@ -250,20 +289,20 @@ function createApp(db, options = {}) {
       </script></main></body></html>`);
   });
 
-  app.post("/api/auth/verify-email", authLimiter, (req, res) => {
+  app.post("/api/auth/verify-email", authLimiter, async (req, res) => {
     if (!isObject(req.body) || typeof req.body.token !== "string" ||
         !/^[A-Za-z0-9_-]{40,100}$/.test(req.body.token)) {
       throw new HttpError(400, "Verification token is invalid.");
     }
-    const challenge = db.prepare("SELECT * FROM email_verification_tokens WHERE token_hash = ?")
+    const challenge = await db.prepare("SELECT * FROM email_verification_tokens WHERE token_hash = ?")
       .get(digest(req.body.token));
     if (!challenge || challenge.expires_at <= new Date().toISOString()) {
       throw new HttpError(400, "Verification token is invalid or expired.");
     }
     const now = new Date().toISOString();
-    db.transaction(() => {
-      db.prepare("UPDATE users SET email_verified_at = ?, updated_at = ? WHERE id = ?").run(now, now, challenge.user_id);
-      db.prepare("DELETE FROM email_verification_tokens WHERE user_id = ?").run(challenge.user_id);
+    await db.transaction(async () => {
+      await db.prepare("UPDATE users SET email_verified_at = ?, updated_at = ? WHERE id = ?").run(now, now, challenge.user_id);
+      await db.prepare("DELETE FROM email_verification_tokens WHERE user_id = ?").run(challenge.user_id);
     })();
     res.json({ emailVerified: true });
   });
@@ -274,28 +313,28 @@ function createApp(db, options = {}) {
     if (typeof req.body.code !== "string" || !/^\d{6}$/.test(req.body.code)) {
       throw new HttpError(400, "Enter the six-digit verification code.");
     }
-    const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
-    if (!user || !verifyPhoneCode(db, user.id, req.body.code)) {
+    const user = await db.prepare("SELECT * FROM users WHERE email = ?").get(email);
+    if (!user || !await verifyPhoneCode(db, user.id, req.body.code)) {
       throw new HttpError(400, "Verification code is invalid or expired.");
     }
     const now = new Date().toISOString();
-    db.transaction(() => {
-      db.prepare("UPDATE users SET phone_verified_at = ?, updated_at = ? WHERE id = ?").run(now, now, user.id);
-      db.prepare("DELETE FROM phone_verification_codes WHERE user_id = ?").run(user.id);
+    await db.transaction(async () => {
+      await db.prepare("UPDATE users SET phone_verified_at = ?, updated_at = ? WHERE id = ?").run(now, now, user.id);
+      await db.prepare("DELETE FROM phone_verification_codes WHERE user_id = ?").run(user.id);
     })();
     if (!user.email_verified_at) {
       return res.json({ phoneVerified: true, emailVerificationRequired: true });
     }
-    const updatedUser = db.prepare("SELECT * FROM users WHERE id = ?").get(user.id);
-    res.json({ phoneVerified: true, user: publicUser(updatedUser), ...createSession(db, user.id) });
+    const updatedUser = await db.prepare("SELECT * FROM users WHERE id = ?").get(user.id);
+    res.json({ phoneVerified: true, user: publicUser(updatedUser), ...await createSession(db, user.id) });
   });
 
-  app.post("/api/auth/logout", requireAuth(db), (req, res) => {
-    db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(req.auth.tokenHash);
+  app.post("/api/auth/logout", requireAuth(db), async (req, res) => {
+    await db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(req.auth.tokenHash);
     res.status(204).end();
   });
 
-  app.get("/api/auth/me", requireAuth(db), (req, res) => {
+  app.get("/api/auth/me", requireAuth(db), async (req, res) => {
     res.json({ user: publicUser(req.auth.user) });
   });
 
@@ -318,7 +357,7 @@ function createApp(db, options = {}) {
       values.phone = normalizePhone(req.body.phone);
       if (values.phone !== req.auth.user.phone) {
         fields.push("phone_verified_at = NULL");
-        db.prepare("DELETE FROM phone_verification_codes WHERE user_id = ?").run(req.auth.user.id);
+        await db.prepare("DELETE FROM phone_verification_codes WHERE user_id = ?").run(req.auth.user.id);
       }
     }
     if (Object.hasOwn(req.body, "location")) {
@@ -328,10 +367,10 @@ function createApp(db, options = {}) {
 
     values.id = req.auth.user.id;
     values.updatedAt = new Date().toISOString();
-    db.prepare(`UPDATE users SET ${fields.join(", ")}, updated_at = @updatedAt WHERE id = @id`).run(values);
-    const updatedUser = db.prepare("SELECT * FROM users WHERE id = ?").get(values.id);
+    await db.prepare(`UPDATE users SET ${fields.join(", ")}, updated_at = @updatedAt WHERE id = @id`).run(values);
+    const updatedUser = await db.prepare("SELECT * FROM users WHERE id = ?").get(values.id);
     if (values.phone && values.phone !== req.auth.user.phone) {
-      const code = issuePhoneCode(db, values.id);
+      const code = await issuePhoneCode(db, values.id);
       try {
         await services.sendSms({ to: values.phone, message: `Your ZimConnect verification code is ${code}. It expires in 10 minutes.` });
       } catch (error) {
@@ -342,15 +381,15 @@ function createApp(db, options = {}) {
     res.json({ user: publicUser(updatedUser) });
   });
 
-  app.get("/api/profile/notification-preferences", requireAuth(db), (req, res) => {
-    const user = db.prepare(`
+  app.get("/api/profile/notification-preferences", requireAuth(db), async (req, res) => {
+    const user = await db.prepare(`
       SELECT email_notifications_enabled AS email, sms_notifications_enabled AS sms
       FROM users WHERE id = ?
     `).get(req.auth.user.id);
     res.json({ email: Boolean(user.email), sms: Boolean(user.sms) });
   });
 
-  app.patch("/api/profile/notification-preferences", requireAuth(db), (req, res) => {
+  app.patch("/api/profile/notification-preferences", requireAuth(db), async (req, res) => {
     if (!isObject(req.body) || !Object.keys(req.body).length ||
         Object.keys(req.body).some((key) => !["email", "sms"].includes(key)) ||
         Object.values(req.body).some((value) => typeof value !== "boolean")) {
@@ -368,12 +407,12 @@ function createApp(db, options = {}) {
     }
     values.id = req.auth.user.id;
     values.updatedAt = new Date().toISOString();
-    db.prepare(`UPDATE users SET ${fields.join(", ")}, updated_at = @updatedAt WHERE id = @id`).run(values);
+    await db.prepare(`UPDATE users SET ${fields.join(", ")}, updated_at = @updatedAt WHERE id = @id`).run(values);
     res.json({ email: Boolean(values.email ?? req.auth.user.email_notifications_enabled), sms: Boolean(values.sms ?? req.auth.user.sms_notifications_enabled) });
   });
 
-  app.get("/api/admin/users", requireAuth(db), requireRole("admin"), (req, res) => {
-    const users = db.prepare(`
+  app.get("/api/admin/users", requireAuth(db), requireRole("admin"), async (req, res) => {
+    const users = await db.prepare(`
       SELECT id, full_name AS fullName, email, phone, location, role, email_verified_at AS emailVerifiedAt,
         phone_verified_at AS phoneVerifiedAt, identity_status AS identityStatus, created_at AS createdAt
       FROM users ORDER BY created_at DESC LIMIT 200
@@ -381,31 +420,33 @@ function createApp(db, options = {}) {
     res.json({ users });
   });
 
-  app.patch("/api/admin/users/:id/role", requireAuth(db), requireRole("admin"), (req, res) => {
+  app.patch("/api/admin/users/:id/role", requireAuth(db), requireRole("admin"), async (req, res) => {
     const roles = new Set(["consumer", "business", "supplier", "delivery_agent", "admin"]);
     const role = req.body && req.body.role;
     if (!roles.has(role)) throw new HttpError(400, "Role is invalid.");
     if (req.params.id === req.auth.user.id && role !== "admin") {
       throw new HttpError(400, "Use another administrator to change your own role.");
     }
-    const user = db.prepare("SELECT id, role, email_verified_at, phone_verified_at, identity_status FROM users WHERE id = ?").get(req.params.id);
-    if (!user) throw new HttpError(404, "User not found.");
-    if (!user.email_verified_at || !user.phone_verified_at) throw new HttpError(409, "Verify the user's email and phone before assigning a role.");
-    if (["business", "supplier", "delivery_agent"].includes(role) && user.identity_status !== "verified") {
-      throw new HttpError(409, "Approve the user's identity documents before assigning this role.");
-    }
-    const updateRole = db.transaction(() => {
-      if (user.role === "admin" && role !== "admin") {
-        const admins = db.prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'admin'").get().count;
+    const user = await db.transaction(async () => {
+      const current = await db.prepare("SELECT id, role, email_verified_at, phone_verified_at, identity_status FROM users WHERE id = ?").get(req.params.id);
+      if (!current) throw new HttpError(404, "User not found.");
+      if (!current.email_verified_at || !current.phone_verified_at) {
+        throw new HttpError(409, "Verify the user's email and phone before assigning a role.");
+      }
+      if (["business", "supplier", "delivery_agent"].includes(role) && current.identity_status !== "verified") {
+        throw new HttpError(409, "Approve the user's identity documents before assigning this role.");
+      }
+      if (current.role === "admin" && role !== "admin") {
+        const admins = (await db.prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'admin'").get()).count;
         if (admins < 2) throw new HttpError(409, "The last administrator cannot be demoted.");
       }
-      db.prepare("UPDATE users SET role = ?, updated_at = ? WHERE id = ?").run(role, new Date().toISOString(), user.id);
-      db.prepare(`
+      await db.prepare("UPDATE users SET role = ?, updated_at = ? WHERE id = ?").run(role, new Date().toISOString(), current.id);
+      await db.prepare(`
         INSERT INTO admin_audit_log (id, actor_id, action, target_type, target_id, details, created_at)
         VALUES (?, ?, 'user.role.change', 'user', ?, ?, ?)
-      `).run(crypto.randomUUID(), req.auth.user.id, user.id, JSON.stringify({ from: user.role, to: role }), new Date().toISOString());
-    });
-    updateRole.immediate();
+      `).run(crypto.randomUUID(), req.auth.user.id, current.id, JSON.stringify({ from: current.role, to: role }), new Date().toISOString());
+      return current;
+    })();
     res.json({ id: user.id, role });
   });
 
@@ -438,7 +479,7 @@ function createApp(db, options = {}) {
     if (error.status === 415) {
       return res.status(415).json({ error: "Unsupported request content type or encoding." });
     }
-    if (error.code === "SQLITE_CONSTRAINT_UNIQUE") {
+    if (error.code === "SQLITE_CONSTRAINT_UNIQUE" || error.code === "23505") {
       return res.status(409).json({ error: "The requested value is already in use." });
     }
     console.error(error);
@@ -484,27 +525,27 @@ function escapeHtml(value) {
   })[character]);
 }
 
-function createSession(db, userId) {
+async function createSession(db, userId) {
   const token = crypto.randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + SESSION_DURATION_MS).toISOString();
-  db.prepare("INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)")
+  await db.prepare("INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)")
     .run(digestToken(token), userId, expiresAt, new Date().toISOString());
   return { token, expiresAt };
 }
 
 function requireAuth(db) {
-  return (req, res, next) => {
+  return async (req, res, next) => {
     const match = /^Bearer ([A-Za-z0-9_-]+)$/.exec(req.get("authorization") || "");
     if (!match) return res.status(401).json({ error: "Authentication required." });
 
     const tokenHash = digestToken(match[1]);
-    const row = db.prepare(`
+    const row = await db.prepare(`
       SELECT sessions.token_hash, sessions.expires_at, users.*
       FROM sessions JOIN users ON users.id = sessions.user_id
       WHERE sessions.token_hash = ?
     `).get(tokenHash);
     if (!row || row.expires_at <= new Date().toISOString()) {
-      if (row) db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(tokenHash);
+      if (row) await db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(tokenHash);
       return res.status(401).json({ error: "Session is invalid or expired." });
     }
 
@@ -523,28 +564,37 @@ if (require.main === module) {
     console.error(error.message);
     process.exit(1);
   }
-  const db = createDatabase(process.env.DATABASE_PATH);
+  startServer().catch((error) => {
+    console.error("Backend startup failed:", error);
+    process.exitCode = 1;
+  });
+}
+
+async function startServer() {
+  const db = await createDatabase(process.env.DATABASE_URL || process.env.DATABASE_PATH);
   const app = createApp(db);
   const port = Number(process.env.PORT || 3000);
-  const host = process.env.HOST || "127.0.0.1";
+  const host = process.env.HOST || (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1");
   const server = app.listen(port, host, () => {
-    console.log(`ZimConnect backend listening on http://${host}:${port}`);
+    console.log(`ZimConnect backend listening on ${host}:${port}`);
   });
   let backupTimer;
-  if (process.env.BACKUP_ENCRYPTION_KEY) {
-    const createScheduledBackup = () => createEncryptedBackup(
+  if (process.env.BACKUP_ENCRYPTION_KEY || process.env.BACKUP_KMS_KEY_ID) {
+    const createBackup = () => createEncryptedBackup(
       db,
       process.env.BACKUP_DIRECTORY || path.join(__dirname, "backups"),
       Number(process.env.BACKUP_RETENTION_DAYS || 30)
-    ).then((file) => console.log(`Encrypted backup created: ${file}`))
-      .catch((error) => console.error("Scheduled encrypted backup failed:", error));
+    );
+    const createScheduledBackup = () => (db.isPostgres
+      ? db.withAdvisoryLock(431908112, createBackup)
+      : createBackup()).then((file) => {
+      if (file) console.log(`Encrypted off-site backup created: ${file}`);
+    }).catch((error) => console.error("Scheduled encrypted backup failed:", error));
     createScheduledBackup();
-    backupTimer = setInterval(() => {
-      createScheduledBackup();
-    }, 24 * 60 * 60 * 1000);
+    backupTimer = setInterval(createScheduledBackup, 24 * 60 * 60 * 1000);
     backupTimer.unref();
   } else {
-    console.warn("Automated backups are disabled; configure BACKUP_ENCRYPTION_KEY.");
+    console.warn("Automated backups are disabled; configure AWS KMS or BACKUP_ENCRYPTION_KEY.");
   }
   const retentionTimer = setInterval(() => {
     purgeExpiredData(db).catch((error) => console.error("Scheduled data retention cleanup failed:", error));
@@ -572,8 +622,7 @@ if (require.main === module) {
     clearInterval(retentionTimer);
     clearInterval(notificationTimer);
     server.close(() => {
-      db.close();
-      process.exit(0);
+      db.close().finally(() => process.exit(0));
     });
   };
   process.on("SIGINT", shutdown);

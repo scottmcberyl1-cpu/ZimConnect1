@@ -1,6 +1,8 @@
 const nodemailer = require("nodemailer");
 const OpenAI = require("openai");
 const net = require("node:net");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
 const {
   S3Client, CopyObjectCommand, DeleteObjectCommand, HeadObjectCommand, PutObjectCommand, GetObjectCommand
 } = require("@aws-sdk/client-s3");
@@ -9,8 +11,119 @@ const { HttpError } = require("./errors");
 
 let cachedS3Client;
 
+const PAYNOW_BASE_URL = "https://www.paynow.co.zw";
+
+function paynowKey() {
+  const key = process.env.PAYNOW_INTEGRATION_KEY;
+  if (!process.env.PAYNOW_INTEGRATION_ID || !key) {
+    throw new HttpError(503, "Paynow payments are not configured.");
+  }
+  return key;
+}
+
+function paynowHash(entries) {
+  return crypto.createHash("sha512")
+    .update(entries.filter(([name]) => name.toLowerCase() !== "hash").map(([, value]) => value).join("") + paynowKey())
+    .digest("hex")
+    .toUpperCase();
+}
+
+function verifyPaynowHash(entries) {
+  const hashEntry = entries.find(([name]) => name.toLowerCase() === "hash");
+  if (!hashEntry || !/^[A-Fa-f0-9]{128}$/.test(hashEntry[1])) return false;
+  const expected = Buffer.from(paynowHash(entries), "hex");
+  const received = Buffer.from(hashEntry[1], "hex");
+  return expected.length === received.length && crypto.timingSafeEqual(expected, received);
+}
+
+function parsePaynowMessage(body) {
+  const params = new URLSearchParams(body);
+  const entries = Array.from(params.entries());
+  if (!entries.length || entries.some(([, value]) => value.length > 4096)) {
+    throw new HttpError(502, "Paynow returned an invalid response.");
+  }
+  const fields = {};
+  for (const [name, value] of entries) {
+    const key = name.toLowerCase();
+    if (Object.hasOwn(fields, key)) throw new HttpError(502, "Paynow returned duplicate response fields.");
+    fields[key] = value;
+  }
+  return { entries, fields };
+}
+
+function paynowUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || !(url.hostname === "paynow.co.zw" || url.hostname.endsWith(".paynow.co.zw"))) {
+      throw new Error("Untrusted Paynow URL");
+    }
+    return url.toString();
+  } catch (error) {
+    throw new HttpError(502, "Paynow returned an invalid payment URL.");
+  }
+}
+
+async function postPaynow(url, body) {
+  let response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/x-www-form-urlencoded" },
+      body,
+      signal: AbortSignal.timeout(15000)
+    });
+  } catch (error) {
+    throw new HttpError(502, "Paynow could not be reached.");
+  }
+  if (!response.ok) throw new HttpError(502, "Paynow rejected the payment request.");
+  const text = await response.text();
+  if (text.length > 16000) throw new HttpError(502, "Paynow returned an oversized response.");
+  return parsePaynowMessage(text);
+}
+
+async function initiatePaynowPayment({ reference, amountCents, email, returnUrl, resultUrl }) {
+  const fields = [
+    ["id", process.env.PAYNOW_INTEGRATION_ID],
+    ["reference", reference],
+    ["amount", (amountCents / 100).toFixed(2)],
+    ["additionalinfo", `ZimConnect order ${reference}`],
+    ["returnurl", returnUrl],
+    ["resulturl", resultUrl],
+    ["authemail", email],
+    ["status", "Message"]
+  ];
+  const payload = new URLSearchParams([...fields, ["hash", paynowHash(fields)]]);
+  const { entries, fields: response } = await postPaynow(`${PAYNOW_BASE_URL}/interface/initiatetransaction`, payload);
+  if (response.status !== "ok" || !verifyPaynowHash(entries)) {
+    throw new HttpError(502, "Paynow could not authenticate the checkout response.");
+  }
+  if (!response.browserurl || !response.pollurl) {
+    throw new HttpError(502, "Paynow returned an incomplete checkout response.");
+  }
+  return {
+    checkoutUrl: paynowUrl(response.browserurl),
+    pollUrl: paynowUrl(response.pollurl),
+    paynowReference: response.paynowreference || null
+  };
+}
+
+async function pollPaynowTransaction(pollUrl) {
+  const { entries, fields } = await postPaynow(paynowUrl(pollUrl), "");
+  if (!verifyPaynowHash(entries)) throw new HttpError(502, "Paynow status response could not be authenticated.");
+  return {
+    reference: fields.reference,
+    amount: fields.amount,
+    paynowReference: fields.paynowreference,
+    status: fields.status
+  };
+}
+
+function verifyPaynowCallback(fields) {
+  return verifyPaynowHash(Object.entries(fields));
+}
+
 function s3Client() {
-  if (!process.env.S3_BUCKET || !process.env.AWS_REGION) {
+  if (!process.env.AWS_REGION) {
     throw new HttpError(503, "Private object storage is not configured.");
   }
   if (!cachedS3Client) {
@@ -23,7 +136,21 @@ function s3Client() {
   return cachedS3Client;
 }
 
+async function uploadEncryptedBackup(filePath) {
+  const bucket = process.env.BACKUP_S3_BUCKET;
+  if (!bucket) throw new HttpError(503, "Off-site backup storage is not configured.");
+  const fileName = require("node:path").basename(filePath);
+  await s3Client().send(new PutObjectCommand({
+    Bucket: bucket,
+    Key: `encrypted-backups/${fileName}`,
+    Body: fs.createReadStream(filePath),
+    ContentType: "application/octet-stream",
+    ServerSideEncryption: "AES256"
+  }));
+}
+
 async function createPrivateUploadUrl(key, contentType, expiresIn = 300) {
+  if (!process.env.S3_BUCKET) throw new HttpError(503, "Private object storage is not configured.");
   const command = new PutObjectCommand({
     Bucket: process.env.S3_BUCKET,
     Key: key,
@@ -283,6 +410,10 @@ async function answerSupportQuestion(message) {
 }
 
 module.exports = {
+  uploadEncryptedBackup,
+  initiatePaynowPayment,
+  pollPaynowTransaction,
+  verifyPaynowCallback,
   createPrivateUploadUrl,
   inspectPrivateObject,
   validatePrivateObject,

@@ -8,7 +8,7 @@ const { createApp } = require("./server");
 
 test("registration, profile updates, and logout use authenticated sessions", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zimconnect-test-"));
-  const db = createDatabase(path.join(directory, "test.sqlite"));
+  const db = await createDatabase(path.join(directory, "test.sqlite"));
   const outbound = { email: [], sms: [] };
   const uploadedKeys = new Map();
   const services = {
@@ -38,7 +38,7 @@ test("registration, profile updates, and logout use authenticated sessions", asy
   await new Promise((resolve) => server.once("listening", resolve));
   t.after(async () => {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-    db.close();
+    await db.close();
     fs.rmSync(directory, { recursive: true, force: true });
   });
 
