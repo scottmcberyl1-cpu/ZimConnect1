@@ -1,6 +1,6 @@
-# ZimConnect — Frontend Prototype
+# ZimConnect
 
-A responsive, interactive front-end prototype for the ZimConnect digital business ecosystem.
+A responsive front-end prototype and starter authentication/profile backend for the ZimConnect digital business ecosystem.
 
 ## Included
 - Consumer home and marketplace
@@ -20,9 +20,30 @@ A responsive, interactive front-end prototype for the ZimConnect digital busines
 - Responsive desktop/mobile navigation
 
 ## Run
-Open `index.html` in a browser, or use Visual Studio Code with the Live Server extension.
+
+Requires Node.js 20 or newer.
+
+```sh
+npm install
+npm start
+```
+
+Open `http://127.0.0.1:3000`. The server also serves the frontend on the same origin. Set `PORT`, `HOST`, or `DATABASE_PATH` to override the defaults. The SQLite database is created at `backend/data/zimconnect.sqlite`.
+
+Run the backend tests with `npm test`.
+
+## Authentication and profile API
+
+- `POST /api/auth/register` — create a consumer account (`fullName`, `email`, `password`; optional `phone`, `location`)
+- `POST /api/auth/login` — authenticate with `email` and `password`
+- `POST /api/auth/logout` — revoke the current session
+- `GET /api/auth/me` — return the authenticated profile
+- `PATCH /api/profile` — update `fullName`, `phone`, and/or `location`
+- `GET /api/health` — check server and database availability
+
+Register and login return a bearer token and expiry timestamp. Send the token in an `Authorization: Bearer <token>` header for protected routes. Passwords are scrypt-hashed and only token digests are stored in SQLite. Public registration always creates a consumer account; account roles cannot be changed through the profile API.
 
 ## Important
-This is a front-end prototype. Real authentication, database storage, identity-document verification, payment gateways, maps/live GPS, video storage, notifications, AI support and production security must be connected through a backend before deployment.
+This is an early backend foundation, not a production-ready commerce platform. Payment gateways, identity-document verification, maps/live GPS, video storage, notifications, AI support, email/phone verification, role administration, backups, and production security review are not implemented.
 
-Sensitive National ID data should be encrypted, access-controlled and never displayed publicly.
+Do not submit or store National ID documents or numbers through this API. Sensitive identity data requires a separately designed, encrypted, access-controlled verification workflow.
