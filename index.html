@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ZimConnect — Connect. Trade. Deliver. Learn. Grow.</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="toast" class="toast"></div>
+
+  <header class="topbar">
+    <div class="brand" onclick="showPage('home')">
+      <div class="brand-mark">🇿🇼</div>
+      <div><strong>Zim<span>Connect</span></strong><small>Connect. Trade. Deliver. Learn. Grow.</small></div>
+    </div>
+    <div class="global-search">
+      <span>⌕</span><input id="globalSearch" placeholder="Search products, businesses, suppliers..." onkeydown="searchFromHeader(event)">
+    </div>
+    <div class="header-actions">
+      <button class="icon-btn" onclick="showPage('support')" title="Notifications">🔔</button>
+      <button class="profile-btn" onclick="showPage('profile')">Beryl ▾</button>
+    </div>
+  </header>
+
+  <div class="app-shell">
+    <aside class="sidebar">
+      <button class="nav-item active" data-page="home" onclick="showPage('home')">🏠 <span>Home</span></button>
+      <button class="nav-item" data-page="explore" onclick="showPage('explore')">🔎 <span>Explore</span></button>
+      <button class="nav-item" data-page="suppliers" onclick="showPage('suppliers')">🏭 <span>Suppliers</span></button>
+      <button class="nav-item" data-page="orders" onclick="showPage('orders')">📦 <span>Orders</span></button>
+      <button class="nav-item" data-page="delivery" onclick="showPage('delivery')">🚚 <span>Delivery</span></button>
+      <button class="nav-item" data-page="academy" onclick="showPage('academy')">🎓 <span>Academy</span></button>
+      <button class="nav-item" data-page="opportunities" onclick="showPage('opportunities')">💼 <span>Opportunities</span></button>
+      <button class="nav-item" data-page="advertise" onclick="showPage('advertise')">📢 <span>Advertise</span></button>
+      <button class="nav-item" data-page="support" onclick="showPage('support')">🆘 <span>Support</span></button>
+      <div class="sidebar-bottom">
+        <button class="nav-item" data-page="business" onclick="showPage('business')">🏪 <span>Business Dashboard</span></button>
+        <button class="nav-item" data-page="supplierDash" onclick="showPage('supplierDash')">📊 <span>Supplier Dashboard</span></button>
+        <button class="nav-item" data-page="admin" onclick="showPage('admin')">🛡️ <span>Admin Panel</span></button>
+      </div>
+    </aside>
+
+    <main id="app"></main>
+  </div>
+
+  <nav class="mobile-nav">
+    <button onclick="showPage('home')">🏠<small>Home</small></button>
+    <button onclick="showPage('explore')">🔎<small>Explore</small></button>
+    <button onclick="showPage('orders')">📦<small>Orders</small></button>
+    <button onclick="showPage('support')">🆘<small>Support</small></button>
+    <button onclick="showPage('profile')">👤<small>Profile</small></button>
+  </nav>
+
+<script src="js/app.js"></script>
+</body>
+</html>
