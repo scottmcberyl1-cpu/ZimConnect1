@@ -9,9 +9,14 @@ function requiredProductionSettings(env) {
     "DATABASE_URL",
     "PUBLIC_BASE_URL",
     "CORS_ORIGINS",
+    "TRUST_PROXY_HOPS",
     "BACKUP_KMS_KEY_ID",
     "BACKUP_S3_BUCKET",
-    "AWS_REGION"
+    "AWS_REGION",
+    "IDENTITY_RETENTION_DAYS",
+    "GPS_RETENTION_DAYS",
+    "VIDEO_RETENTION_DAYS",
+    "BACKUP_RETENTION_DAYS"
   ];
   if (isEnabled(env, "PAYNOW_ENABLED")) required.push("PAYNOW_INTEGRATION_ID", "PAYNOW_INTEGRATION_KEY");
   if (isEnabled(env, "IDENTITY_UPLOADS_ENABLED") || isEnabled(env, "VIDEO_UPLOADS_ENABLED")) {
@@ -45,8 +50,7 @@ function validateConfiguration(env = process.env) {
   if (!/^postgres(?:ql)?:\/\//i.test(env.DATABASE_URL)) {
     throw new Error("DATABASE_URL must use PostgreSQL in production.");
   }
-  const proxyHops = Number(env.TRUST_PROXY_HOPS || 1);
-  if (!Number.isInteger(proxyHops) || proxyHops < 0 || proxyHops > 5) {
+  if (!/^[0-5]$/.test(env.TRUST_PROXY_HOPS)) {
     throw new Error("TRUST_PROXY_HOPS must be an integer from 0 to 5.");
   }
   const origins = env.CORS_ORIGINS.split(",").map((origin) => origin.trim()).filter(Boolean);
@@ -70,13 +74,13 @@ function validateConfiguration(env = process.env) {
   if (env.S3_ENDPOINT && !env.S3_ENDPOINT.startsWith("https://")) {
     throw new Error("S3_ENDPOINT must use HTTPS in production.");
   }
-  for (const [name, fallback] of [
-    ["IDENTITY_RETENTION_DAYS", 30],
-    ["GPS_RETENTION_DAYS", 7],
-    ["VIDEO_RETENTION_DAYS", 30],
-    ["BACKUP_RETENTION_DAYS", 30]
+  for (const name of [
+    "IDENTITY_RETENTION_DAYS",
+    "GPS_RETENTION_DAYS",
+    "VIDEO_RETENTION_DAYS",
+    "BACKUP_RETENTION_DAYS"
   ]) {
-    const value = Number(env[name] || fallback);
+    const value = Number(env[name]);
     if (!Number.isInteger(value) || value < 1 || value > 3650) {
       throw new Error(`${name} must be between 1 and 3650 days.`);
     }

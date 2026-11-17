@@ -25,14 +25,21 @@ test("registration, profile updates, and logout use authenticated sessions", asy
     deletePrivateObject: async () => {},
     createPrivateDownloadUrl: async () => "https://private-storage.example/download"
   };
-  const originalEnvironment = { nodeEnv: process.env.NODE_ENV, paymentMode: process.env.PAYMENT_MODE };
+  const environmentNames = [
+    "NODE_ENV", "PAYNOW_ENABLED", "IDENTITY_UPLOADS_ENABLED",
+    "IDENTITY_POLICY_URL", "IDENTITY_POLICY_VERSION"
+  ];
+  const originalEnvironment = Object.fromEntries(environmentNames.map((name) => [name, process.env[name]]));
   process.env.NODE_ENV = "test";
-  process.env.PAYMENT_MODE = "sandbox";
+  process.env.PAYNOW_ENABLED = "false";
+  process.env.IDENTITY_UPLOADS_ENABLED = "true";
+  process.env.IDENTITY_POLICY_URL = "https://example.com/identity-policy";
+  process.env.IDENTITY_POLICY_VERSION = "test-v1";
   t.after(() => {
-    if (originalEnvironment.nodeEnv === undefined) delete process.env.NODE_ENV;
-    else process.env.NODE_ENV = originalEnvironment.nodeEnv;
-    if (originalEnvironment.paymentMode === undefined) delete process.env.PAYMENT_MODE;
-    else process.env.PAYMENT_MODE = originalEnvironment.paymentMode;
+    for (const name of environmentNames) {
+      if (originalEnvironment[name] === undefined) delete process.env[name];
+      else process.env[name] = originalEnvironment[name];
+    }
   });
   const server = createApp(db, { providers: services }).listen(0, "127.0.0.1");
   await new Promise((resolve) => server.once("listening", resolve));
@@ -100,18 +107,39 @@ test("registration, profile updates, and logout use authenticated sessions", asy
   assert.equal(login.status, 200);
   assert.ok((await login.json()).token);
 
-  const payment = await fetch(`${baseUrl}/api/payments/intents`, {
+  await db.prepare("UPDATE users SET role = 'business', identity_status = 'verified' WHERE id = ?").run(user.id);
+  const productResponse = await fetch(`${baseUrl}/api/products`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-    body: JSON.stringify({ amount: 12.34 })
+    body: JSON.stringify({ name: "Test product", description: "Test order item", price: 12.34, stock: 3 })
   });
-  assert.equal(payment.status, 201);
-  assert.equal((await payment.json()).mode, "sandbox");
+  assert.equal(productResponse.status, 201);
+  const product = await productResponse.json();
+  const orderResponse = await fetch(`${baseUrl}/api/orders`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ items: [{ productId: product.id, quantity: 1 }] })
+  });
+  assert.equal(orderResponse.status, 201);
+  const order = await orderResponse.json();
+  assert.equal(order.payment.mode, "sandbox");
+  assert.equal(order.payment.status, "sandbox_pending");
+  const paymentCompletion = await fetch(`${baseUrl}/api/payments/${order.payment.id}/sandbox/complete`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` }
+  });
+  assert.equal(paymentCompletion.status, 200);
+  assert.equal((await paymentCompletion.json()).status, "sandbox_paid");
 
   const identityUpload = await fetch(`${baseUrl}/api/identity/documents`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-    body: JSON.stringify({ documentType: "id_front", contentType: "image/jpeg", fileSize: 100 })
+    body: JSON.stringify({
+      documentType: "id_front",
+      contentType: "image/jpeg",
+      fileSize: 100,
+      legalConsent: true
+    })
   });
   assert.equal(identityUpload.status, 201);
   const upload = await identityUpload.json();
